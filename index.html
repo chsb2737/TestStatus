@@ -506,6 +506,17 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         const boldTag = bold && !alreadyBold ? "<b/>" : "";
         return `<rPr>${boldTag}${rFontXml}</rPr>`;
       }
+      function withBlackColor(fontInnerXml, rgb) {
+        const inner = fontInnerXml || "";
+        const colorTag = `<color rgb="${rgb}"/>`;
+        if (/<color\b[^>]*\/>/.test(inner)) {
+          return inner.replace(/<color\b[^>]*\/>/, colorTag);
+        }
+        if (/<sz\b[^>]*\/>/.test(inner)) {
+          return inner.replace(/(<sz\b[^>]*\/>)/, `$1${colorTag}`);
+        }
+        return colorTag + inner;
+      }
       var StylesManager = class {
         constructor(xmlText) {
           this.original = xmlText;
@@ -519,6 +530,23 @@ https://github.com/nodeca/pako/blob/main/LICENSE
           this._cache = /* @__PURE__ */ new Map();
           const fontsM = /<fonts count="\d+"[^>]*>([\s\S]*?)<\/fonts>/.exec(xmlText);
           this.fonts = fontsM ? fontsM[1].match(/<font>[\s\S]*?<\/font>/g) || [] : [];
+          this.newFonts = [];
+          this._fontCache = /* @__PURE__ */ new Map();
+        }
+        // fontId 의 글꼴을 복제하되 색상만 rgb(예: "FF000000")로 강제 지정한 새 <font> 항목을 추가하고
+        // 그 새 fontId 를 반환한다. 동일한 (fontId, rgb) 조합은 캐시하여 중복 생성하지 않는다.
+        _cloneFontWithColorRgb(fontId, rgb) {
+          const fid = fontId === void 0 || fontId === null || isNaN(fontId) ? 0 : fontId;
+          const key = fid + "|" + rgb;
+          if (this._fontCache.has(key))
+            return this._fontCache.get(key);
+          const rawFont = this.fonts[fid] || this.fonts[0] || "<font/>";
+          const inner = rawFont.replace(/^<font>/, "").replace(/<\/font>$/, "").replace(/^<font\/>$/, "");
+          const newInner = withBlackColor(inner, rgb);
+          const newFontId = this.fonts.length + this.newFonts.length;
+          this.newFonts.push(`<font>${newInner}</font>`);
+          this._fontCache.set(key, newFontId);
+          return newFontId;
         }
         // 특정 셀 스타일(cellXfs 인덱스)이 쓰는 fontId 를 반환.
         getFontIdForStyle(styleIdx) {
@@ -584,8 +612,10 @@ https://github.com/nodeca/pako/blob/main/LICENSE
           return s;
         }
         /**
-         * oldIdx 스타일을 복제하되 overrides({fillId, alignHorizontal})를 적용한 새 스타일 인덱스를 반환.
-         * 동일한 (oldIdx, overrides) 조합은 캐시하여 중복 생성하지 않는다.
+         * oldIdx 스타일을 복제하되 overrides({fillId, alignHorizontal, fontColor})를 적용한 새 스타일
+         * 인덱스를 반환한다. 동일한 (oldIdx, overrides) 조합은 캐시하여 중복 생성하지 않는다.
+         * fontColor(예: "FF000000")가 지정되면 원본 글꼴을 복제해 색상만 바꾼 새 <font> 항목을 만들고
+         * 그 fontId 를 사용한다(원본 폰트/다른 셀에는 전혀 영향 없음).
          */
         cloneWithOverrides(oldIdx, overrides) {
           if (oldIdx === void 0 || oldIdx === null)
@@ -601,12 +631,22 @@ https://github.com/nodeca/pako/blob/main/LICENSE
             xf.fillId = String(overrides.fillId);
             xf.applyFill = overrides.fillId === "0" ? void 0 : "1";
           }
-          if (overrides && overrides.alignHorizontal !== void 0 && xf.alignment !== null) {
-            if (/horizontal="[^"]*"/.test(xf.alignment)) {
-              xf.alignment = xf.alignment.replace(/horizontal="[^"]*"/, `horizontal="${overrides.alignHorizontal}"`);
+          if (overrides && overrides.alignHorizontal !== void 0) {
+            if (xf.alignment !== null) {
+              if (/horizontal="[^"]*"/.test(xf.alignment)) {
+                xf.alignment = xf.alignment.replace(/horizontal="[^"]*"/, `horizontal="${overrides.alignHorizontal}"`);
+              } else {
+                xf.alignment = `horizontal="${overrides.alignHorizontal}" ` + xf.alignment;
+              }
             } else {
-              xf.alignment = `horizontal="${overrides.alignHorizontal}" ` + xf.alignment;
+              xf.alignment = `horizontal="${overrides.alignHorizontal}"`;
             }
+          }
+          if (overrides && overrides.fontColor !== void 0) {
+            const origFontId = xf.fontId !== void 0 ? parseInt(xf.fontId, 10) : 0;
+            const newFontId = this._cloneFontWithColorRgb(origFontId, overrides.fontColor);
+            xf.fontId = String(newFontId);
+            xf.applyFont = "1";
           }
           const newIdx = this.xfs.length + this.newXfs.length;
           this.newXfs.push(this._serializeXf(xf));
@@ -614,12 +654,21 @@ https://github.com/nodeca/pako/blob/main/LICENSE
           return newIdx;
         }
         serialize() {
-          const newCount = this.xfs.length + this.newXfs.length;
-          const newBody = this.body + this.newXfs.join("");
-          return this.original.replace(
+          const newXfCount = this.xfs.length + this.newXfs.length;
+          const newXfBody = this.body + this.newXfs.join("");
+          let out = this.original.replace(
             /<cellXfs count="\d+">[\s\S]*?<\/cellXfs>/,
-            `<cellXfs count="${newCount}">${newBody}</cellXfs>`
+            `<cellXfs count="${newXfCount}">${newXfBody}</cellXfs>`
           );
+          if (this.newFonts.length > 0) {
+            const newFontCount = this.fonts.length + this.newFonts.length;
+            const addedFonts = this.newFonts.join("");
+            out = out.replace(
+              /<fonts count="\d+"([^>]*)>([\s\S]*?)<\/fonts>/,
+              (whole, attrs, body) => `<fonts count="${newFontCount}"${attrs}>${body}${addedFonts}</fonts>`
+            );
+          }
+          return out;
         }
       };
       module.exports = {
@@ -639,7 +688,8 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         parseRowCells,
         cellAttr,
         buildCell,
-        buildRunPr
+        buildRunPr,
+        withBlackColor
       };
     }
   });
@@ -694,7 +744,8 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         const newEnd = end >= insertIdx ? end + delta : end;
         return rowTagAttrs.replace(m[0], `spans="${start}:${newEnd}"`);
       }
-      function insertColumnsAndShift(sheetXml, insertIdx, delta, sharedStrings, newColumnContentFn, stylesManager) {
+      function insertColumnsAndShift(sheetXml, insertIdx, delta, sharedStrings, newColumnContentFn, stylesManager, opts) {
+        opts = opts || {};
         let xml = sheetXml;
         const colsResult = shiftColsBlock(xml, insertIdx, delta);
         xml = colsResult.xml;
@@ -748,14 +799,16 @@ https://github.com/nodeca/pako/blob/main/LICENSE
             let style = styleSrc ? U.cellAttr(styleSrc.attrs, "s") : cloneSources[k] && cloneSources[k].style;
             const styleForFont = style;
             if (!isHeader && stylesManager && style !== void 0) {
-              const overrides = k === 0 ? { fillId: "0" } : { fillId: "0", alignHorizontal: "center" };
+              const overrides = opts.forceLeftBlackNewCols ? { fillId: "0", alignHorizontal: "left", fontColor: "FF000000" } : k === 0 ? { fillId: "0" } : { fillId: "0", alignHorizontal: "center" };
               style = stylesManager.cloneWithOverrides(parseInt(style, 10), overrides);
             }
             const content = newColumnContentFn(rowNum, isHeader, k, { oldCell: styleSrc, cloneSources });
             if (content && content.runs && content.runs.length > 0) {
               const fontStyleIdx = styleForFont !== void 0 ? parseInt(styleForFont, 10) : void 0;
               const fontId = stylesManager && fontStyleIdx !== void 0 ? stylesManager.getFontIdForStyle(fontStyleIdx) : null;
-              const fontInner = stylesManager && fontId !== null ? stylesManager.getFontInner(fontId) : "";
+              let fontInner = stylesManager && fontId !== null ? stylesManager.getFontInner(fontId) : "";
+              if (opts.forceLeftBlackNewCols)
+                fontInner = U.withBlackColor(fontInner, "FF000000");
               const idx = sharedStrings.addRichText(content.runs, fontInner);
               newCellsXml.push(U.buildCell(colLetter, rowNum, style, { sharedStringIdx: idx }));
             } else if (content && content.text !== void 0 && content.text !== null && content.text !== "") {
@@ -984,7 +1037,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
           const origStyle = p.styleIdx !== void 0 && p.styleIdx !== null ? parseInt(p.styleIdx, 10) : void 0;
           let style = origStyle;
           if (stylesManager && style !== void 0) {
-            const overrides = p.center ? { fillId: "0", alignHorizontal: "center" } : { fillId: "0" };
+            const overrides = p.alignHorizontal ? { fillId: "0", alignHorizontal: p.alignHorizontal } : { fillId: "0" };
             style = stylesManager.cloneWithOverrides(style, overrides);
           }
           if (p.blank) {
@@ -1398,9 +1451,9 @@ https://github.com/nodeca/pako/blob/main/LICENSE
               const bracketLine = isNextBase ? `[${bumpTrailingRoundNumber(bracketPrefix)} \uD655\uC778\uACB0\uACFC]` : `[${bracketPrefix}+\uC7AC\uD655\uC778${nextRound}\uCC28 \uD655\uC778\uACB0\uACFC]`;
               const runs = buildConfirmResultRuns(bracketLine);
               const t = runs.map((r) => r.text).join("");
-              plan.push({ colLetter, text: t, runs, styleIdx: srcStyle, blank: false });
+              plan.push({ colLetter, text: t, runs, styleIdx: srcStyle, blank: false, alignHorizontal: "left" });
             } else {
-              plan.push({ colLetter, text: null, styleIdx: srcStyle, blank: true, center: true });
+              plan.push({ colLetter, text: null, styleIdx: srcStyle, blank: true, alignHorizontal: "left" });
             }
           } else if (dropdowns[colLetter]) {
             plan.push({ colLetter, text: dropdowns[colLetter], styleIdx: srcStyle, blank: false });
@@ -1678,7 +1731,8 @@ ${newHeading}`;
           const sheetKind = sheetName === "\uBB38\uC81C\uC810" ? "munjejeom" : "other";
           const sheetNextRound = mode === "nextBase" ? info.baseRound + 1 : info.currentMaxRound + 1;
           const contentFn = B.makeNewColumnContentFn(sheetKind, info, sheetNextRound, info.lastDataRow, mode);
-          xml = SO.insertColumnsAndShift(xml, info.insertIdx, 3, sharedStrings, contentFn, stylesManager);
+          const columnOpts = { forceLeftBlackNewCols: sheetName === "\uBB38\uC81C\uC810" };
+          xml = SO.insertColumnsAndShift(xml, info.insertIdx, 3, sharedStrings, contentFn, stylesManager, columnOpts);
           updatedSheetXml[path] = xml;
           if (sheetName === "\uBB38\uC81C\uC810")
             munjejeomInfo = info;
@@ -1901,11 +1955,17 @@ ${newHeading}`;
     return name.slice(0, digitsStart) + `${nextRound}차` + name.slice(digitsEnd);
   }
 
-  // mode: "reconfirm"(기존과 완전히 동일 - 파일명의 차수 표기는 절대 바꾸지 않음, 날짜만 갱신)
-  //     | "nextBase"(파일명 안의 기본 차수 표기도 N차 -> (N+1)차 로 함께 바꾼 뒤 날짜를 갱신)
+  // mode: "reconfirm"(N차+재확인M차 - 파일명의 차수 표기와 날짜 모두 그대로 유지. 날짜는
+  //         절대 오늘 날짜로 바꾸지 않는다 - 기존 파일명을 그대로 재사용한다)
+  //     | "nextBase"(파일명 안의 기본 차수 표기를 N차 -> (N+1)차 로 바꾸고, 날짜도 오늘 날짜로 갱신)
   function buildOutputName(originalName, runDate, mode, baseRound) {
-    const dateStr = fmtDateDot(runDate);
     const name = mode === "nextBase" ? bumpRoundInFilename(originalName, baseRound) : originalName;
+    // 재확인(reconfirm) 변환은 파일명을 전혀 건드리지 않는다 - 기존 날짜(예: 2026.09.03)를
+    // 실행일 날짜로 바꾸지 않고 원본 파일명을 그대로 사용한다.
+    if (mode !== "nextBase") {
+      return name;
+    }
+    const dateStr = fmtDateDot(runDate);
     if (DATE_TAG_RE.test(name)) {
       return name.replace(DATE_TAG_RE, `(${dateStr}~)`);
     }
